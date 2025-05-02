@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
 // Package h264writer implements H264 media container writer
 package h264writer
 
@@ -24,9 +27,9 @@ type (
 	}
 )
 
-// New builds a new H264 writer
+// New builds a new H264 writer.
 func New(filename string) (*H264Writer, error) {
-	f, err := os.Create(filename)
+	f, err := os.Create(filename) //nolint:gosec
 	if err != nil {
 		return nil, err
 	}
@@ -34,14 +37,14 @@ func New(filename string) (*H264Writer, error) {
 	return NewWith(f), nil
 }
 
-// NewWith initializes a new H264 writer with an io.Writer output
+// NewWith initializes a new H264 writer with an io.Writer output.
 func NewWith(w io.Writer) *H264Writer {
 	return &H264Writer{
 		writer: w,
 	}
 }
 
-// WriteRTP adds a new packet and writes the appropriate headers for it
+// WriteRTP adds a new packet and writes the appropriate headers for it.
 func (h *H264Writer) WriteRTP(packet *rtp.Packet) error {
 	if len(packet.Payload) == 0 {
 		return nil
@@ -59,7 +62,7 @@ func (h *H264Writer) WriteRTP(packet *rtp.Packet) error {
 	}
 
 	data, err := h.cachedPacket.Unmarshal(packet.Payload)
-	if err != nil {
+	if err != nil || len(data) == 0 {
 		return err
 	}
 
@@ -68,7 +71,7 @@ func (h *H264Writer) WriteRTP(packet *rtp.Packet) error {
 	return err
 }
 
-// Close closes the underlying writer
+// Close closes the underlying writer.
 func (h *H264Writer) Close() error {
 	h.cachedPacket = nil
 	if h.writer != nil {

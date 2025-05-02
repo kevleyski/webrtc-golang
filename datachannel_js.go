@@ -1,8 +1,13 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
+//go:build js && wasm
 // +build js,wasm
 
 package webrtc
 
 import (
+	"errors"
 	"fmt"
 	"syscall/js"
 
@@ -22,11 +27,18 @@ type DataChannel struct {
 	// syscall/js API. Initially nil.
 	onOpenHandler       *js.Func
 	onCloseHandler      *js.Func
+	onClosingHandler    *js.Func
 	onMessageHandler    *js.Func
 	onBufferedAmountLow *js.Func
+	onErrorHandler      *js.Func
 
 	// A reference to the associated api object used by this datachannel
 	api *API
+}
+
+// JSValue returns the underlying RTCDataChannel
+func (d *DataChannel) JSValue() js.Value {
+	return d.underlying
 }
 
 // OnOpen sets an event handler which is invoked when
@@ -57,6 +69,39 @@ func (d *DataChannel) OnClose(f func()) {
 	})
 	d.onCloseHandler = &onCloseHandler
 	d.underlying.Set("onclose", onCloseHandler)
+}
+
+// FYI `OnClosing` is not implemented in the non-JS version of Pion.
+
+func (d *DataChannel) OnClosing(f func()) {
+	if d.onClosingHandler != nil {
+		oldHandler := d.onClosingHandler
+		defer oldHandler.Release()
+	}
+	onClosingHandler := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		go f()
+		return js.Undefined()
+	})
+	d.onClosingHandler = &onClosingHandler
+	d.underlying.Set("onclosing", onClosingHandler)
+}
+
+func (d *DataChannel) OnError(f func(err error)) {
+	if d.onErrorHandler != nil {
+		oldHandler := d.onErrorHandler
+		defer oldHandler.Release()
+	}
+	onErrorHandler := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		event := args[0]
+		errorObj := event.Get("error")
+		// FYI RTCError has some extra properties, e.g. `errorDetail`:
+		// https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/error_event
+		errorMessage := errorObj.Get("message").String()
+		go f(errors.New(errorMessage))
+		return js.Undefined()
+	})
+	d.onErrorHandler = &onErrorHandler
+	d.underlying.Set("onerror", onErrorHandler)
 }
 
 // OnMessage sets an event handler which is invoked on a binary message arrival
@@ -111,7 +156,7 @@ func (d *DataChannel) SendText(s string) (err error) {
 // Before calling Detach you have to enable this behavior by calling
 // webrtc.DetachDataChannels(). Combining detached and normal data channels
 // is not supported.
-// Please reffer to the data-channels-detach example and the
+// Please refer to the data-channels-detach example and the
 // pion/datachannel documentation for the correct way to handle the
 // resulting DataChannel object.
 func (d *DataChannel) Detach() (datachannel.ReadWriteCloser, error) {
@@ -141,11 +186,17 @@ func (d *DataChannel) Close() (err error) {
 	if d.onCloseHandler != nil {
 		d.onCloseHandler.Release()
 	}
+	if d.onClosingHandler != nil {
+		d.onClosingHandler.Release()
+	}
 	if d.onMessageHandler != nil {
 		d.onMessageHandler.Release()
 	}
 	if d.onBufferedAmountLow != nil {
 		d.onBufferedAmountLow.Release()
+	}
+	if d.onErrorHandler != nil {
+		d.onErrorHandler.Release()
 	}
 
 	return nil
@@ -162,7 +213,7 @@ func (d *DataChannel) Label() string {
 // out-of-order delivery is allowed.
 func (d *DataChannel) Ordered() bool {
 	ordered := d.underlying.Get("ordered")
-	if jsValueIsUndefined(ordered) {
+	if ordered.IsUndefined() {
 		return true // default is true
 	}
 	return ordered.Bool()
@@ -171,13 +222,13 @@ func (d *DataChannel) Ordered() bool {
 // MaxPacketLifeTime represents the length of the time window (msec) during
 // which transmissions and retransmissions may occur in unreliable mode.
 func (d *DataChannel) MaxPacketLifeTime() *uint16 {
-	if !jsValueIsUndefined(d.underlying.Get("maxPacketLifeTime")) {
+	if !d.underlying.Get("maxPacketLifeTime").IsUndefined() {
 		return valueToUint16Pointer(d.underlying.Get("maxPacketLifeTime"))
-	} else {
-		// See https://bugs.chromium.org/p/chromium/issues/detail?id=696681
-		// Chrome calls this "maxRetransmitTime"
-		return valueToUint16Pointer(d.underlying.Get("maxRetransmitTime"))
 	}
+
+	// See https://bugs.chromium.org/p/chromium/issues/detail?id=696681
+	// Chrome calls this "maxRetransmitTime"
+	return valueToUint16Pointer(d.underlying.Get("maxRetransmitTime"))
 }
 
 // MaxRetransmits represents the maximum number of retransmissions that are
@@ -242,7 +293,7 @@ func (d *DataChannel) SetBufferedAmountLowThreshold(th uint64) {
 }
 
 // OnBufferedAmountLow sets an event handler which is invoked when
-// the number of bytes of outgoing data becomes lower than the
+// the number of bytes of outgoing data becomes lower than or equal to the
 // BufferedAmountLowThreshold.
 func (d *DataChannel) OnBufferedAmountLow(f func()) {
 	if d.onBufferedAmountLow != nil {

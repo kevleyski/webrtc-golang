@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
 package h264writer
 
 import (
@@ -13,10 +16,10 @@ type writerCloser struct {
 	bytes.Buffer
 }
 
-var errCloseErr = errors.New("close error")
+var errClose = errors.New("close error")
 
 func (w *writerCloser) Close() error {
-	return errCloseErr
+	return errClose
 }
 
 func TestNewWith(t *testing.T) {
@@ -149,4 +152,41 @@ func TestWriteRTP(t *testing.T) {
 			}
 		})
 	}
+}
+
+type writerCounter struct {
+	writeCount int
+}
+
+func (w *writerCounter) Write([]byte) (int, error) {
+	w.writeCount++
+
+	return 0, nil
+}
+
+func (w *writerCounter) Close() error {
+	return nil
+}
+
+func TestNoZeroWrite(t *testing.T) {
+	payloads := [][]byte{
+		{0x1c, 0x80, 0x01, 0x02, 0x03},
+		{0x1c, 0x00, 0x04, 0x05, 0x06},
+		{0x1c, 0x00, 0x07, 0x08, 0x09},
+		{0x1c, 0x00, 0x10, 0x11, 0x12},
+		{0x1c, 0x40, 0x13, 0x14, 0x15},
+	}
+
+	writer := &writerCounter{}
+	h264Writer := &H264Writer{
+		hasKeyFrame: true,
+		writer:      writer,
+	}
+
+	for i := range payloads {
+		assert.NoError(t, h264Writer.WriteRTP(&rtp.Packet{
+			Payload: payloads[i],
+		}))
+	}
+	assert.Equal(t, 1, writer.writeCount)
 }

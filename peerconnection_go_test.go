@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
+//go:build !js
 // +build !js
 
 package webrtc
@@ -11,19 +15,22 @@ import (
 	"crypto/x509"
 	"fmt"
 	"math/big"
-	"reflect"
+	"net"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/pion/ice/v2"
+	"github.com/pion/dtls/v3"
+	"github.com/pion/ice/v4"
+	"github.com/pion/logging"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
-	"github.com/pion/transport/test"
-	"github.com/pion/transport/vnet"
-	"github.com/pion/webrtc/v3/internal/util"
-	"github.com/pion/webrtc/v3/pkg/rtcerr"
+	"github.com/pion/transport/v3/test"
+	"github.com/pion/transport/v3/vnet"
+	"github.com/pion/webrtc/v4/internal/util"
+	"github.com/pion/webrtc/v4/pkg/rtcerr"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -267,14 +274,12 @@ func TestPeerConnection_SetConfiguration_Go(t *testing.T) {
 		},
 	} {
 		pc, err := test.init()
-		if err != nil {
-			t.Errorf("SetConfiguration %q: init failed: %v", test.name, err)
-		}
+		assert.NoErrorf(t, err, "SetConfiguration %q: init failed", test.name)
 
 		err = pc.SetConfiguration(test.config)
-		if got, want := err, test.wantErr; !reflect.DeepEqual(got, want) {
-			t.Errorf("SetConfiguration %q: err = %v, want %v", test.name, got, want)
-		}
+		// This is supposed to be assert.Equal, and not assert.ErrorIs,
+		// The error is a pointer to a struct.
+		assert.Equal(t, test.wantErr, err, "SetConfiguration %q", test.name)
 
 		assert.NoError(t, pc.Close())
 	}
@@ -300,13 +305,13 @@ func TestPeerConnection_EventHandlers_Go(t *testing.T) {
 
 	// Verify that the noop case works
 	assert.NotPanics(t, func() { pc.onTrack(nil, nil) })
-	assert.NotPanics(t, func() { pc.onICEConnectionStateChange(ice.ConnectionStateNew) })
+	assert.NotPanics(t, func() { pc.onICEConnectionStateChange(ICEConnectionStateNew) })
 
-	pc.OnTrack(func(t *TrackRemote, r *RTPReceiver) {
+	pc.OnTrack(func(*TrackRemote, *RTPReceiver) {
 		close(onTrackCalled)
 	})
 
-	pc.OnICEConnectionStateChange(func(cs ICEConnectionState) {
+	pc.OnICEConnectionStateChange(func(ICEConnectionState) {
 		close(onICEConnectionStateChangeCalled)
 	})
 
@@ -325,7 +330,7 @@ func TestPeerConnection_EventHandlers_Go(t *testing.T) {
 
 	// Verify that the set handlers are called
 	assert.NotPanics(t, func() { pc.onTrack(&TrackRemote{}, &RTPReceiver{}) })
-	assert.NotPanics(t, func() { pc.onICEConnectionStateChange(ice.ConnectionStateNew) })
+	assert.NotPanics(t, func() { pc.onICEConnectionStateChange(ICEConnectionStateNew) })
 	assert.NotPanics(t, func() { go pc.onDataChannelHandler(&DataChannel{api: api}) })
 
 	<-onTrackCalled
@@ -335,7 +340,7 @@ func TestPeerConnection_EventHandlers_Go(t *testing.T) {
 }
 
 // This test asserts that nothing deadlocks we try to shutdown when DTLS is in flight
-// We ensure that DTLS is in flight by removing the mux func for it, so all inbound DTLS is lost
+// We ensure that DTLS is in flight by removing the mux func for it, so all inbound DTLS is lost.
 func TestPeerConnection_ShutdownNoDTLS(t *testing.T) {
 	lim := test.TimeOut(time.Second * 10)
 	defer lim.Stop()
@@ -345,9 +350,7 @@ func TestPeerConnection_ShutdownNoDTLS(t *testing.T) {
 
 	api := NewAPI()
 	offerPC, answerPC, err := api.newPair(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 
 	// Drop all incoming DTLS traffic
 	dropAllDTLS := func([]byte) bool {
@@ -356,9 +359,7 @@ func TestPeerConnection_ShutdownNoDTLS(t *testing.T) {
 	offerPC.dtlsTransport.dtlsMatcher = dropAllDTLS
 	answerPC.dtlsTransport.dtlsMatcher = dropAllDTLS
 
-	if err = signalPair(offerPC, answerPC); err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, signalPair(offerPC, answerPC))
 
 	iceComplete := make(chan interface{})
 	answerPC.OnICEConnectionStateChange(func(iceState ICEConnectionState) {
@@ -402,13 +403,9 @@ func TestPeerConnection_AnswerWithoutOffer(t *testing.T) {
 	defer report()
 
 	pc, err := NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Errorf("New PeerConnection: got error: %v", err)
-	}
+	assert.NoError(t, err)
 	_, err = pc.CreateAnswer(nil)
-	if !reflect.DeepEqual(&rtcerr.InvalidStateError{Err: ErrNoRemoteDescription}, err) {
-		t.Errorf("CreateAnswer without RemoteDescription: got error: %v", err)
-	}
+	assert.Equal(t, &rtcerr.InvalidStateError{Err: ErrNoRemoteDescription}, err)
 
 	assert.NoError(t, pc.Close())
 }
@@ -472,7 +469,12 @@ func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
 		{
 			"No local Transceivers, every remote should get nil",
 			[]RTPCodecType{RTPCodecTypeVideo, RTPCodecTypeAudio, RTPCodecTypeVideo, RTPCodecTypeVideo},
-			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv, RTPTransceiverDirectionRecvonly, RTPTransceiverDirectionSendonly, RTPTransceiverDirectionInactive},
+			[]RTPTransceiverDirection{
+				RTPTransceiverDirectionSendrecv,
+				RTPTransceiverDirectionRecvonly,
+				RTPTransceiverDirectionSendonly,
+				RTPTransceiverDirectionInactive,
+			},
 
 			[]*RTPTransceiver{},
 
@@ -508,10 +510,7 @@ func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
 			},
 		},
 	} {
-		if len(test.kinds) != len(test.directions) {
-			t.Fatal("Kinds and Directions must be the same length")
-		}
-
+		assert.Len(t, test.kinds, len(test.directions), "Kinds and Directions must be the same length")
 		got := []*RTPTransceiver{}
 		for i := range test.kinds {
 			res, filteredLocalTransceivers := satisfyTypeAndDirection(test.kinds[i], test.directions[i], test.localTransceivers)
@@ -520,18 +519,7 @@ func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
 			test.localTransceivers = filteredLocalTransceivers
 		}
 
-		if !reflect.DeepEqual(got, test.want) {
-			gotStr := ""
-			for _, t := range got {
-				gotStr += fmt.Sprintf("%+v\n", t)
-			}
-
-			wantStr := ""
-			for _, t := range test.want {
-				wantStr += fmt.Sprintf("%+v\n", t)
-			}
-			t.Errorf("satisfyTypeAndDirection %q: \ngot\n%s \nwant\n%s", test.name, gotStr, wantStr)
-		}
+		assert.Equal(t, test.want, got, "satisfyTypeAndDirection %q", test.name)
 	}
 }
 
@@ -562,80 +550,45 @@ func TestOneAttrKeyConnectionSetupPerMediaDescriptionInSDP(t *testing.T) {
 	assert.NoError(t, pc.Close())
 }
 
-func TestPeerConnection_OfferingLite(t *testing.T) {
+func TestPeerConnection_IceLite(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
 	lim := test.TimeOut(time.Second * 10)
 	defer lim.Stop()
 
-	s := SettingEngine{}
-	s.SetLite(true)
-	offerPC, err := NewAPI(WithSettingEngine(s)).NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
+	connectTwoAgents := func(offerIsLite, answerisLite bool) {
+		offerSettingEngine := SettingEngine{}
+		offerSettingEngine.SetLite(offerIsLite)
+		offerPC, err := NewAPI(WithSettingEngine(offerSettingEngine)).NewPeerConnection(Configuration{})
+		assert.NoError(t, err)
+
+		answerSettingEngine := SettingEngine{}
+		answerSettingEngine.SetLite(answerisLite)
+		answerPC, err := NewAPI(WithSettingEngine(answerSettingEngine)).NewPeerConnection(Configuration{})
+		assert.NoError(t, err)
+		assert.NoError(t, signalPair(offerPC, answerPC))
+
+		dataChannelOpen := make(chan interface{})
+		answerPC.OnDataChannel(func(_ *DataChannel) {
+			close(dataChannelOpen)
+		})
+
+		<-dataChannelOpen
+		closePairNow(t, offerPC, answerPC)
 	}
 
-	answerPC, err := NewAPI().NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err = signalPair(offerPC, answerPC); err != nil {
-		t.Fatal(err)
-	}
-
-	iceComplete := make(chan interface{})
-	answerPC.OnICEConnectionStateChange(func(iceState ICEConnectionState) {
-		if iceState == ICEConnectionStateConnected {
-			select {
-			case <-iceComplete:
-			default:
-				close(iceComplete)
-			}
-		}
+	t.Run("Offerer", func(*testing.T) {
+		connectTwoAgents(true, false)
 	})
 
-	<-iceComplete
-	closePairNow(t, offerPC, answerPC)
-}
-
-func TestPeerConnection_AnsweringLite(t *testing.T) {
-	report := test.CheckRoutines(t)
-	defer report()
-
-	lim := test.TimeOut(time.Second * 10)
-	defer lim.Stop()
-
-	offerPC, err := NewAPI().NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s := SettingEngine{}
-	s.SetLite(true)
-	answerPC, err := NewAPI(WithSettingEngine(s)).NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err = signalPair(offerPC, answerPC); err != nil {
-		t.Fatal(err)
-	}
-
-	iceComplete := make(chan interface{})
-	answerPC.OnICEConnectionStateChange(func(iceState ICEConnectionState) {
-		if iceState == ICEConnectionStateConnected {
-			select {
-			case <-iceComplete:
-			default:
-				close(iceComplete)
-			}
-		}
+	t.Run("Answerer", func(*testing.T) {
+		connectTwoAgents(false, true)
 	})
 
-	<-iceComplete
-	closePairNow(t, offerPC, answerPC)
+	t.Run("Both", func(*testing.T) {
+		connectTwoAgents(true, true)
+	})
 }
 
 func TestOnICEGatheringStateChange(t *testing.T) {
@@ -643,31 +596,20 @@ func TestOnICEGatheringStateChange(t *testing.T) {
 	seenComplete := &atomicBool{}
 
 	seenGatheringAndComplete := make(chan interface{})
-	seenClosed := make(chan interface{})
 
 	peerConn, err := NewPeerConnection(Configuration{})
 	assert.NoError(t, err)
 
-	var onStateChange func(s ICEGathererState)
-	onStateChange = func(s ICEGathererState) {
+	var onStateChange func(s ICEGatheringState)
+	onStateChange = func(s ICEGatheringState) {
 		// Access to ICEGatherer in the callback must not cause dead lock.
 		peerConn.OnICEGatheringStateChange(onStateChange)
-		if state := peerConn.iceGatherer.State(); state != s {
-			t.Errorf("State change callback argument (%s) and State() (%s) result differs",
-				s, state,
-			)
-		}
 
 		switch s { // nolint:exhaustive
-		case ICEGathererStateClosed:
-			close(seenClosed)
-			return
-		case ICEGathererStateGathering:
-			if seenComplete.get() {
-				t.Error("Completed before gathering")
-			}
+		case ICEGatheringStateGathering:
+			assert.False(t, seenGathering.get(), "Completed before gathering")
 			seenGathering.set(true)
-		case ICEGathererStateComplete:
+		case ICEGatheringStateComplete:
 			seenComplete.set(true)
 		}
 
@@ -683,30 +625,26 @@ func TestOnICEGatheringStateChange(t *testing.T) {
 
 	select {
 	case <-time.After(time.Second * 10):
-		t.Fatal("Gathering and Complete were never seen")
-	case <-seenClosed:
-		t.Fatal("Closed before PeerConnection Close")
+		assert.Fail(t, "Gathering and Complete were never seen")
 	case <-seenGatheringAndComplete:
 	}
 
 	assert.NoError(t, peerConn.Close())
-
-	select {
-	case <-time.After(time.Second * 10):
-		t.Fatal("Closed was never seen")
-	case <-seenClosed:
-	}
 }
 
-// Assert Trickle ICE behaviors
-func TestPeerConnectionTrickle(t *testing.T) {
+// Assert Trickle ICE behaviors.
+func TestPeerConnectionTrickle(t *testing.T) { //nolint:cyclop
 	offerPC, answerPC, err := newPair()
 	assert.NoError(t, err)
 
 	_, err = offerPC.CreateDataChannel("test-channel", nil)
 	assert.NoError(t, err)
 
-	addOrCacheCandidate := func(pc *PeerConnection, c *ICECandidate, candidateCache []ICECandidateInit) []ICECandidateInit {
+	addOrCacheCandidate := func(
+		pc *PeerConnection,
+		c *ICECandidate,
+		candidateCache []ICECandidateInit,
+	) []ICECandidateInit {
 		if c == nil {
 			return candidateCache
 		}
@@ -716,6 +654,7 @@ func TestPeerConnectionTrickle(t *testing.T) {
 		}
 
 		assert.NoError(t, pc.AddICECandidate(c.ToJSON()))
+
 		return candidateCache
 	}
 
@@ -724,9 +663,7 @@ func TestPeerConnectionTrickle(t *testing.T) {
 
 	cachedOfferCandidates := []ICECandidateInit{}
 	offerPC.OnICECandidate(func(c *ICECandidate) {
-		if offerCandidateDone {
-			t.Error("Received OnICECandidate after finishing gathering")
-		}
+		assert.False(t, offerCandidateDone, "Received OnICECandidate after finishing gathering")
 		if c == nil {
 			offerCandidateDone = true
 		}
@@ -739,9 +676,7 @@ func TestPeerConnectionTrickle(t *testing.T) {
 
 	cachedAnswerCandidates := []ICECandidateInit{}
 	answerPC.OnICECandidate(func(c *ICECandidate) {
-		if answerCandidateDone {
-			t.Error("Received OnICECandidate after finishing gathering")
-		}
+		assert.False(t, answerCandidateDone, "Received OnICECandidate after finishing gathering")
 		if c == nil {
 			answerCandidateDone = true
 		}
@@ -792,7 +727,7 @@ func TestPeerConnectionTrickle(t *testing.T) {
 	closePairNow(t, offerPC, answerPC)
 }
 
-// Issue #1121, assert populateLocalCandidates doesn't mutate
+// Issue #1121, assert populateLocalCandidates doesn't mutate.
 func TestPopulateLocalCandidates(t *testing.T) {
 	t.Run("PendingLocalDescription shouldn't add extra mutations", func(t *testing.T) {
 		pc, err := NewPeerConnection(Configuration{})
@@ -832,7 +767,7 @@ func TestPopulateLocalCandidates(t *testing.T) {
 	})
 }
 
-// Assert that two agents that only generate mDNS candidates can connect
+// Assert that two agents that only generate mDNS candidates can connect.
 func TestMulticastDNSCandidates(t *testing.T) {
 	lim := test.TimeOut(time.Second * 30)
 	defer lim.Stop()
@@ -849,7 +784,7 @@ func TestMulticastDNSCandidates(t *testing.T) {
 	assert.NoError(t, signalPair(pcOffer, pcAnswer))
 
 	onDataChannel, onDataChannelCancel := context.WithCancel(context.Background())
-	pcAnswer.OnDataChannel(func(d *DataChannel) {
+	pcAnswer.OnDataChannel(func(*DataChannel) {
 		onDataChannelCancel()
 	})
 	<-onDataChannel.Done()
@@ -936,7 +871,7 @@ func TestICERestart(t *testing.T) {
 	closePairNow(t, offerPC, answerPC)
 }
 
-// Assert error handling when an Agent is restart
+// Assert error handling when an Agent is restart.
 func TestICERestart_Error_Handling(t *testing.T) {
 	iceStates := make(chan ICEConnectionState, 100)
 	blockUntilICEState := func(wantedState ICEConnectionState) {
@@ -972,7 +907,7 @@ func TestICERestart_Error_Handling(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
-	offerPeerConnection, answerPeerConnection, wan := createVNetPair(t)
+	offerPeerConnection, answerPeerConnection, wan := createVNetPair(t, nil)
 
 	pushICEState := func(i ICEConnectionState) { iceStates <- i }
 	offerPeerConnection.OnICEConnectionStateChange(pushICEState)
@@ -982,7 +917,7 @@ func TestICERestart_Error_Handling(t *testing.T) {
 	keepPackets.set(true)
 
 	// Add a filter that monitors the traffic on the router
-	wan.AddChunkFilter(func(c vnet.Chunk) bool {
+	wan.AddChunkFilter(func(vnet.Chunk) bool {
 		return keepPackets.get()
 	})
 
@@ -997,9 +932,9 @@ func TestICERestart_Error_Handling(t *testing.T) {
 	})
 
 	dataChannelAnswerer := make(chan *DataChannel)
-	offerPeerConnection.OnDataChannel(func(d *DataChannel) {
-		d.OnOpen(func() {
-			dataChannelAnswerer <- d
+	offerPeerConnection.OnDataChannel(func(dataChannel *DataChannel) {
+		dataChannel.OnOpen(func() {
+			dataChannelAnswerer <- dataChannel
 		})
 	})
 
@@ -1050,6 +985,7 @@ func (r *trackRecords) newTrack() (*TrackLocalStaticRTP, error) {
 	trackID := fmt.Sprintf("pion-track-%d", len(r.trackIDs))
 	track, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, trackID, "pion")
 	r.trackIDs[trackID] = struct{}{}
+
 	return track, err
 }
 
@@ -1064,14 +1000,15 @@ func (r *trackRecords) handleTrack(t *TrackRemote, _ *RTPReceiver) {
 
 func (r *trackRecords) remains() int {
 	r.mu.Lock()
+
 	defer r.mu.Unlock()
+
 	return len(r.trackIDs) - len(r.receivedTrackIDs)
 }
 
 // This test assure that all track events emits.
-func TestPeerConnection_MassiveTracks(t *testing.T) {
+func TestPeerConnection_MassiveTracks(t *testing.T) { //nolint:cyclop
 	var (
-		api   = NewAPI()
 		tRecs = &trackRecords{
 			trackIDs:         make(map[string]struct{}),
 			receivedTrackIDs: make(map[string]struct{}),
@@ -1100,8 +1037,7 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 		connected = make(chan struct{})
 		stopped   = make(chan struct{})
 	)
-	assert.NoError(t, api.mediaEngine.RegisterDefaultCodecs())
-	offerPC, answerPC, err := api.newPair(Configuration{})
+	offerPC, answerPC, err := newPair()
 	assert.NoError(t, err)
 	// Create massive tracks.
 	for range make([]struct{}, trackCount) {
@@ -1148,7 +1084,7 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 		time.Sleep(pingInterval)
 		select {
 		case <-tooLong:
-			t.Error("unable to receive all track events in time")
+			assert.Fail(t, "unable to receive all track events in time")
 		default:
 		}
 	}
@@ -1174,14 +1110,10 @@ func TestEmptyCandidate(t *testing.T) {
 
 	for i, testCase := range testCases {
 		peerConn, err := NewPeerConnection(Configuration{})
-		if err != nil {
-			t.Errorf("Case %d: got error: %v", i, err)
-		}
+		assert.NoErrorf(t, err, "Case %d failed", i)
 
 		err = peerConn.SetRemoteDescription(SessionDescription{Type: SDPTypeOffer, SDP: minimalOffer})
-		if err != nil {
-			t.Errorf("Case %d: got error: %v", i, err)
-		}
+		assert.NoErrorf(t, err, "Case %d failed", i)
 
 		if testCase.expectError {
 			assert.Error(t, peerConn.AddICECandidate(testCase.ICECandidate))
@@ -1208,7 +1140,7 @@ a=mid:data
 `
 
 // this test asserts that if an ice-lite offer is received,
-// pion will take the ICE-CONTROLLING role
+// pion will take the ICE-CONTROLLING role.
 func TestICELite(t *testing.T) {
 	peerConnection, err := NewPeerConnection(Configuration{})
 	assert.NoError(t, err)
@@ -1222,7 +1154,7 @@ func TestICELite(t *testing.T) {
 
 	assert.NoError(t, peerConnection.SetLocalDescription(SDPAnswer))
 
-	assert.Equal(t, ICERoleControlling, peerConnection.iceTransport.role,
+	assert.Equal(t, ICERoleControlling, peerConnection.iceTransport.Role(),
 		"pion did not set state to ICE-CONTROLLED against ice-light offer")
 
 	assert.NoError(t, peerConnection.Close())
@@ -1248,6 +1180,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			_, err = pc.AddTransceiverFromTrack(track, []RTPTransceiverInit{
 				{Direction: dir},
 			}...)
+
 			return err
 		}
 
@@ -1255,6 +1188,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			RTPCodecTypeVideo,
 			RTPTransceiverInit{Direction: dir},
 		)
+
 		return err
 	}
 
@@ -1274,7 +1208,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			"offer sendonly answer sendrecv",
 			RTPTransceiverDirectionSendonly,
 			RTPTransceiverDirectionSendrecv,
-			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv, RTPTransceiverDirectionRecvonly},
+			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv},
 		},
 		{
 			"offer recvonly answer sendrecv",
@@ -1286,7 +1220,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			"offer sendrecv answer sendonly",
 			RTPTransceiverDirectionSendrecv,
 			RTPTransceiverDirectionSendonly,
-			[]RTPTransceiverDirection{RTPTransceiverDirectionSendonly, RTPTransceiverDirectionRecvonly},
+			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv},
 		},
 		{
 			"offer sendonly answer sendonly",
@@ -1369,12 +1303,8 @@ func TestPeerConnection_SessionID(t *testing.T) {
 			offerSessionID = sessionID
 			offerSessionVersion = sessionVersion
 		} else {
-			if offerSessionID != sessionID {
-				t.Errorf("offer[%v] session id mismatch: expected=%v, got=%v", i, offerSessionID, sessionID)
-			}
-			if offerSessionVersion+1 != sessionVersion {
-				t.Errorf("offer[%v] session version mismatch: expected=%v, got=%v", i, offerSessionVersion+1, sessionVersion)
-			}
+			assert.Equalf(t, offerSessionID, sessionID, "offer[%v] session id mismatch", i)
+			assert.Equalf(t, offerSessionVersion+1, sessionVersion, "offer[%v] session version mismatch", i)
 			offerSessionVersion++
 		}
 
@@ -1385,12 +1315,8 @@ func TestPeerConnection_SessionID(t *testing.T) {
 			answerSessionID = sessionID
 			answerSessionVersion = sessionVersion
 		} else {
-			if answerSessionID != sessionID {
-				t.Errorf("answer[%v] session id mismatch: expected=%v, got=%v", i, answerSessionID, sessionID)
-			}
-			if answerSessionVersion+1 != sessionVersion {
-				t.Errorf("answer[%v] session version mismatch: expected=%v, got=%v", i, answerSessionVersion+1, sessionVersion)
-			}
+			assert.Equalf(t, answerSessionID, sessionID, "answer[%v] session id mismatch", i)
+			assert.Equalf(t, answerSessionVersion+1, sessionVersion, "answer[%v] session version mismatch", i)
 			answerSessionVersion++
 		}
 	}
@@ -1402,22 +1328,22 @@ func TestPeerConnectionNilCallback(t *testing.T) {
 	assert.NoError(t, err)
 
 	pc.onSignalingStateChange(SignalingStateStable)
-	pc.OnSignalingStateChange(func(ss SignalingState) {
-		t.Error("OnSignalingStateChange called")
+	pc.OnSignalingStateChange(func(SignalingState) {
+		assert.Fail(t, "OnSignalingStateChange called")
 	})
 	pc.OnSignalingStateChange(nil)
 	pc.onSignalingStateChange(SignalingStateStable)
 
 	pc.onConnectionStateChange(PeerConnectionStateNew)
-	pc.OnConnectionStateChange(func(pcs PeerConnectionState) {
-		t.Error("OnConnectionStateChange called")
+	pc.OnConnectionStateChange(func(PeerConnectionState) {
+		assert.Fail(t, "OnConnectionStateChange called")
 	})
 	pc.OnConnectionStateChange(nil)
 	pc.onConnectionStateChange(PeerConnectionStateNew)
 
 	pc.onICEConnectionStateChange(ICEConnectionStateNew)
-	pc.OnICEConnectionStateChange(func(ics ICEConnectionState) {
-		t.Error("OnConnectionStateChange called")
+	pc.OnICEConnectionStateChange(func(ICEConnectionState) {
+		assert.Fail(t, "OnICEConnectionStateChange called")
 	})
 	pc.OnICEConnectionStateChange(nil)
 	pc.onICEConnectionStateChange(ICEConnectionStateNew)
@@ -1425,11 +1351,657 @@ func TestPeerConnectionNilCallback(t *testing.T) {
 	pc.onNegotiationNeeded()
 	pc.negotiationNeededOp()
 	pc.OnNegotiationNeeded(func() {
-		t.Error("OnNegotiationNeeded called")
+		assert.Fail(t, "OnNegotiationNeeded called")
 	})
 	pc.OnNegotiationNeeded(nil)
 	pc.onNegotiationNeeded()
 	pc.negotiationNeededOp()
 
 	assert.NoError(t, pc.Close())
+}
+
+func TestTransceiverCreatedByRemoteSdpHasSameCodecOrderAsRemote(t *testing.T) {
+	t.Run("Codec MatchExact", func(t *testing.T) { //nolint:dupl
+		const remoteSdp = `v=0
+o=- 4596489990601351948 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=group:BUNDLE 0 1
+m=video 60323 UDP/TLS/RTP/SAVPF 98 94 106
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:0
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
+a=rtpmap:94 VP8/90000
+a=rtpmap:106 H264/90000
+a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+a=sendonly
+m=video 60323 UDP/TLS/RTP/SAVPF 108 98 125
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:1
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
+a=rtpmap:108 VP8/90000
+a=sendonly
+a=rtpmap:125 H264/90000
+a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+`
+		mediaEngine := MediaEngine{}
+		assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{MimeTypeVP8, 90000, 0, "", nil},
+			PayloadType:        94,
+		}, RTPCodecTypeVideo))
+		assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{
+				MimeTypeH264, 90000, 0, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", nil,
+			},
+			PayloadType: 98,
+		}, RTPCodecTypeVideo))
+
+		api := NewAPI(WithMediaEngine(&mediaEngine))
+		pc, err := api.NewPeerConnection(Configuration{})
+		assert.NoError(t, err)
+		assert.NoError(t, pc.SetRemoteDescription(SessionDescription{
+			Type: SDPTypeOffer,
+			SDP:  remoteSdp,
+		}))
+		ans, _ := pc.CreateAnswer(nil)
+		assert.NoError(t, pc.SetLocalDescription(ans))
+		codecOfTr1 := pc.GetTransceivers()[0].getCodecs()[0]
+		codecs := pc.api.mediaEngine.getCodecsByKind(RTPCodecTypeVideo)
+		_, matchType := codecParametersFuzzySearch(codecOfTr1, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		codecOfTr2 := pc.GetTransceivers()[1].getCodecs()[0]
+		_, matchType = codecParametersFuzzySearch(codecOfTr2, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		assert.EqualValues(t, 94, codecOfTr2.PayloadType)
+		assert.NoError(t, pc.Close())
+	})
+
+	t.Run("Codec PartialExact Only", func(t *testing.T) { //nolint:dupl
+		const remoteSdp = `v=0
+o=- 4596489990601351948 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=group:BUNDLE 0 1
+m=video 60323 UDP/TLS/RTP/SAVPF 98 106
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:0
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+a=rtpmap:106 H264/90000
+a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032
+a=sendonly
+m=video 60323 UDP/TLS/RTP/SAVPF 125 98
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:1
+a=rtpmap:125 H264/90000
+a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+a=sendonly
+`
+		mediaEngine := MediaEngine{}
+		assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{MimeTypeVP8, 90000, 0, "", nil},
+			PayloadType:        94,
+		}, RTPCodecTypeVideo))
+		assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{
+				MimeTypeH264, 90000, 0, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", nil,
+			},
+			PayloadType: 98,
+		}, RTPCodecTypeVideo))
+
+		api := NewAPI(WithMediaEngine(&mediaEngine))
+		pc, err := api.NewPeerConnection(Configuration{})
+		assert.NoError(t, err)
+		assert.NoError(t, pc.SetRemoteDescription(SessionDescription{
+			Type: SDPTypeOffer,
+			SDP:  remoteSdp,
+		}))
+		ans, _ := pc.CreateAnswer(nil)
+		assert.NoError(t, pc.SetLocalDescription(ans))
+		codecOfTr1 := pc.GetTransceivers()[0].getCodecs()[0]
+		codecs := pc.api.mediaEngine.getCodecsByKind(RTPCodecTypeVideo)
+		_, matchType := codecParametersFuzzySearch(codecOfTr1, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		codecOfTr2 := pc.GetTransceivers()[1].getCodecs()[0]
+		_, matchType = codecParametersFuzzySearch(codecOfTr2, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		// h.264/profile-id=640032 should be remap to 106 as same as transceiver 1
+		assert.EqualValues(t, 106, codecOfTr2.PayloadType)
+		assert.NoError(t, pc.Close())
+	})
+}
+
+// Assert that remote candidates with an unknown transport are ignored and logged.
+// This allows us to accept SessionDescriptions with proprietary candidates
+// like `ssltcp`.
+func TestInvalidCandidateTransport(t *testing.T) {
+	const (
+		sslTCPCandidate = `candidate:1 1 ssltcp 1 127.0.0.1 443 typ host generation 0`
+		sslTCPOffer     = `v=0
+o=- 0 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=msid-semantic: WMS
+m=application 9 DTLS/SCTP 5000
+c=IN IP4 0.0.0.0
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:0
+a=` + sslTCPCandidate + "\n"
+	)
+
+	peerConnection, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	assert.NoError(t, peerConnection.SetRemoteDescription(SessionDescription{Type: SDPTypeOffer, SDP: sslTCPOffer}))
+	assert.NoError(t, peerConnection.AddICECandidate(ICECandidateInit{Candidate: sslTCPCandidate}))
+
+	assert.NoError(t, peerConnection.Close())
+}
+
+func TestOfferWithInactiveDirection(t *testing.T) {
+	const remoteSDP = `v=0
+o=- 4596489990601351948 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=fingerprint:sha-256 F7:BF:B4:42:5B:44:C0:B9:49:70:6D:26:D7:3E:E6:08:B1:5B:25:2E:32:88:50:B6:3C:BE:4E:18:A7:2C:85:7C
+a=group:BUNDLE 0
+a=msid-semantic:WMS *
+m=video 9 UDP/TLS/RTP/SAVPF 97
+c=IN IP4 0.0.0.0
+a=inactive
+a=ice-pwd:05d682b2902af03db90d9a9a5f2f8d7f
+a=ice-ufrag:93cc7e4d
+a=mid:0
+a=rtpmap:97 H264/90000
+a=setup:actpass
+a=ssrc:1455629982 cname:{61fd3093-0326-4b12-8258-86bdc1fe677a}
+`
+
+	peerConnection, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	assert.NoError(t, peerConnection.SetRemoteDescription(SessionDescription{Type: SDPTypeOffer, SDP: remoteSDP}))
+	assert.Equal(
+		t, RTPTransceiverDirectionInactive,
+		peerConnection.rtpTransceivers[0].direction.Load().(RTPTransceiverDirection), //nolint:forcetypeassert
+	)
+
+	assert.NoError(t, peerConnection.Close())
+}
+
+func TestPeerConnectionState(t *testing.T) {
+	pc, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+	assert.Equal(t, PeerConnectionStateNew, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateChecking, DTLSTransportStateNew)
+	assert.Equal(t, PeerConnectionStateConnecting, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateConnected, DTLSTransportStateNew)
+	assert.Equal(t, PeerConnectionStateConnecting, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateConnected, DTLSTransportStateConnecting)
+	assert.Equal(t, PeerConnectionStateConnecting, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateConnected, DTLSTransportStateConnected)
+	assert.Equal(t, PeerConnectionStateConnected, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateCompleted, DTLSTransportStateConnected)
+	assert.Equal(t, PeerConnectionStateConnected, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateConnected, DTLSTransportStateClosed)
+	assert.Equal(t, PeerConnectionStateConnected, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateDisconnected, DTLSTransportStateConnected)
+	assert.Equal(t, PeerConnectionStateDisconnected, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateFailed, DTLSTransportStateConnected)
+	assert.Equal(t, PeerConnectionStateFailed, pc.ConnectionState())
+
+	pc.updateConnectionState(ICEConnectionStateConnected, DTLSTransportStateFailed)
+	assert.Equal(t, PeerConnectionStateFailed, pc.ConnectionState())
+
+	assert.NoError(t, pc.Close())
+	assert.Equal(t, PeerConnectionStateClosed, pc.ConnectionState())
+}
+
+func TestPeerConnectionDeadlock(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	closeHdlr := func(peerConnection *PeerConnection) {
+		peerConnection.OnICEConnectionStateChange(func(i ICEConnectionState) {
+			if i == ICEConnectionStateFailed || i == ICEConnectionStateClosed {
+				if err := peerConnection.Close(); err != nil {
+					assert.NoError(t, err)
+				}
+			}
+		})
+	}
+
+	pcOffer, pcAnswer, err := NewAPI().newPair(Configuration{})
+	assert.NoError(t, err)
+
+	assert.NoError(t, signalPair(pcOffer, pcAnswer))
+
+	onDataChannel, onDataChannelCancel := context.WithCancel(context.Background())
+	pcAnswer.OnDataChannel(func(*DataChannel) {
+		onDataChannelCancel()
+	})
+	<-onDataChannel.Done()
+
+	closeHdlr(pcOffer)
+	closeHdlr(pcAnswer)
+
+	closePairNow(t, pcOffer, pcAnswer)
+}
+
+// Assert that by default NULL Ciphers aren't enabled. Even if
+// the remote Peer Requests a NULL Cipher we should fail.
+func TestPeerConnectionNoNULLCipherDefault(t *testing.T) {
+	settingEngine := SettingEngine{}
+	settingEngine.SetSRTPProtectionProfiles(dtls.SRTP_NULL_HMAC_SHA1_80, dtls.SRTP_NULL_HMAC_SHA1_32)
+	offerPC, err := NewAPI(WithSettingEngine(settingEngine)).NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	answerPC, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	assert.NoError(t, signalPair(offerPC, answerPC))
+
+	peerConnectionClosed := make(chan struct{})
+	answerPC.OnConnectionStateChange(func(s PeerConnectionState) {
+		if s == PeerConnectionStateClosed {
+			close(peerConnectionClosed)
+		}
+	})
+
+	<-peerConnectionClosed
+	closePairNow(t, offerPC, answerPC)
+}
+
+// https://github.com/pion/webrtc/issues/2690
+func TestPeerConnectionTrickleMediaStreamIdentification(t *testing.T) {
+	const remoteSdp = `v=0
+o=- 1735985477255306 1 IN IP4 127.0.0.1
+s=VideoRoom 1234
+t=0 0
+a=group:BUNDLE 0 1
+a=ice-options:trickle
+a=fingerprint:sha-256 61:BF:17:29:C0:EF:B2:77:75:79:64:F9:D8:D0:03:6C:5A:D3:9A:BC:E5:F4:5A:05:4C:3C:3B:A0:B4:2B:CF:A8
+a=extmap-allow-mixed
+a=msid-semantic: WMS *
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 127.0.0.1
+a=sendonly
+a=mid:0
+a=rtcp-mux
+a=ice-ufrag:xv3r
+a=ice-pwd:NT22yM6JeOsahq00U9ZJS/
+a=ice-options:trickle
+a=setup:actpass
+a=rtpmap:111 opus/48000/2
+a=rtcp-fb:111 transport-cc
+a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level
+a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid
+a=fmtp:111 useinbandfec=1
+a=msid:janus janus0
+a=ssrc:2280306597 cname:janus
+m=video 9 UDP/TLS/RTP/SAVPF 96 97
+c=IN IP4 127.0.0.1
+a=sendonly
+a=mid:1
+a=rtcp-mux
+a=ice-ufrag:xv3r
+a=ice-pwd:NT22yM6JeOsahq00U9ZJS/
+a=ice-options:trickle
+a=setup:actpass
+a=rtpmap:96 VP8/90000
+a=rtcp-fb:96 ccm fir
+a=rtcp-fb:96 nack
+a=rtcp-fb:96 nack pli
+a=rtcp-fb:96 goog-remb
+a=rtcp-fb:96 transport-cc
+a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
+a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
+a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid
+a=extmap:12 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay
+a=extmap:13 urn:3gpp:video-orientation
+a=rtpmap:97 rtx/90000
+a=fmtp:97 apt=96
+a=ssrc-group:FID 4099488402 29586368
+a=msid:janus janus1
+a=ssrc:4099488402 cname:janus
+a=ssrc:29586368 cname:janus
+`
+
+	mediaEngine := &MediaEngine{}
+
+	assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+		RTPCodecCapability: RTPCodecCapability{
+			MimeType: MimeTypeVP8, ClockRate: 90000, Channels: 0, SDPFmtpLine: "", RTCPFeedback: nil,
+		},
+		PayloadType: 96,
+	}, RTPCodecTypeVideo))
+	assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+		RTPCodecCapability: RTPCodecCapability{
+			MimeType: MimeTypeOpus, ClockRate: 48000, Channels: 0, SDPFmtpLine: "", RTCPFeedback: nil,
+		},
+		PayloadType: 111,
+	}, RTPCodecTypeAudio))
+
+	api := NewAPI(WithMediaEngine(mediaEngine))
+	pc, err := api.NewPeerConnection(Configuration{
+		ICEServers: []ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	pc.OnICECandidate(func(candidate *ICECandidate) {
+		if candidate == nil {
+			return
+		}
+
+		assert.NotEmpty(t, candidate.SDPMid)
+
+		assert.Contains(t, []string{"0", "1"}, candidate.SDPMid)
+		assert.Contains(t, []uint16{0, 1}, candidate.SDPMLineIndex)
+	})
+
+	assert.NoError(t, pc.SetRemoteDescription(SessionDescription{
+		Type: SDPTypeOffer,
+		SDP:  remoteSdp,
+	}))
+
+	gatherComplete := GatheringCompletePromise(pc)
+	ans, _ := pc.CreateAnswer(nil)
+	assert.NoError(t, pc.SetLocalDescription(ans))
+
+	<-gatherComplete
+
+	assert.NoError(t, pc.Close())
+
+	assert.Equal(t, PeerConnectionStateClosed, pc.ConnectionState())
+}
+
+func TestTranceiverMediaStreamIdentification(t *testing.T) {
+	const videoMid = "0"
+	const audioMid = "1"
+
+	mediaEngine := &MediaEngine{}
+
+	assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+		RTPCodecCapability: RTPCodecCapability{
+			MimeType: MimeTypeVP8, ClockRate: 90000, Channels: 0, SDPFmtpLine: "", RTCPFeedback: nil,
+		},
+		PayloadType: 96,
+	}, RTPCodecTypeVideo))
+	assert.NoError(t, mediaEngine.RegisterCodec(RTPCodecParameters{
+		RTPCodecCapability: RTPCodecCapability{
+			MimeType: MimeTypeOpus, ClockRate: 48000, Channels: 0, SDPFmtpLine: "", RTCPFeedback: nil,
+		},
+		PayloadType: 111,
+	}, RTPCodecTypeAudio))
+
+	api := NewAPI(WithMediaEngine(mediaEngine))
+	pcOfferer, pcAnswerer, err := api.newPair(Configuration{
+		ICEServers: []ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	pcOfferer.OnICECandidate(func(candidate *ICECandidate) {
+		if candidate == nil {
+			return
+		}
+
+		assert.NotEmpty(t, candidate.SDPMid)
+		assert.Contains(t, []string{videoMid, audioMid}, candidate.SDPMid)
+		assert.Contains(t, []uint16{0, 1}, candidate.SDPMLineIndex)
+	})
+
+	pcAnswerer.OnICECandidate(func(candidate *ICECandidate) {
+		if candidate == nil {
+			return
+		}
+
+		assert.NotEmpty(t, candidate.SDPMid)
+		assert.Contains(t, []string{videoMid, audioMid}, candidate.SDPMid)
+		assert.Contains(t, []uint16{0, 1}, candidate.SDPMLineIndex)
+	})
+
+	videoTransceiver, err := pcOfferer.AddTransceiverFromKind(RTPCodecTypeVideo, RTPTransceiverInit{
+		Direction: RTPTransceiverDirectionRecvonly,
+	})
+	assert.NoError(t, err)
+
+	audioTransceiver, err := pcOfferer.AddTransceiverFromKind(RTPCodecTypeAudio, RTPTransceiverInit{
+		Direction: RTPTransceiverDirectionRecvonly,
+	})
+	assert.NoError(t, err)
+
+	assert.NoError(t, videoTransceiver.SetMid(videoMid))
+	assert.NoError(t, audioTransceiver.SetMid(audioMid))
+
+	offer, err := pcOfferer.CreateOffer(nil)
+	assert.NoError(t, err)
+
+	assert.NoError(t, pcOfferer.SetLocalDescription(offer))
+
+	assert.NoError(t, pcAnswerer.SetRemoteDescription(offer))
+
+	answer, err := pcAnswerer.CreateAnswer(nil)
+	assert.NoError(t, err)
+
+	assert.NoError(t, pcAnswerer.SetLocalDescription(answer))
+
+	answerGatherComplete := GatheringCompletePromise(pcOfferer)
+	offerGatherComplete := GatheringCompletePromise(pcAnswerer)
+
+	<-answerGatherComplete
+	<-offerGatherComplete
+
+	assert.NoError(t, pcOfferer.Close())
+	assert.NoError(t, pcAnswerer.Close())
+}
+
+func Test_WriteRTCP_Disconnected(t *testing.T) {
+	peerConnection, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	assert.Error(t, peerConnection.WriteRTCP(
+		[]rtcp.Packet{&rtcp.RapidResynchronizationRequest{SenderSSRC: 5, MediaSSRC: 10}}),
+	)
+
+	assert.NoError(t, peerConnection.Close())
+}
+
+func Test_IPv6(t *testing.T) { //nolint: cyclop
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Skip()
+	}
+
+	IPv6Supported := false
+	for _, iface := range interfaces {
+		addrs, netErr := iface.Addrs()
+		if netErr != nil {
+			continue
+		}
+
+		// Loop over the addresses for the interface.
+		for _, addr := range addrs {
+			var ip net.IP
+
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip == nil || ip.To4() != nil || ip.IsLinkLocalUnicast() || ip.IsLoopback() {
+				continue
+			}
+
+			IPv6Supported = true
+		}
+	}
+
+	if !IPv6Supported {
+		t.Skip()
+	}
+
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	settingEngine := SettingEngine{}
+	settingEngine.SetNetworkTypes([]NetworkType{NetworkTypeUDP6})
+
+	offerPC, answerPC, err := NewAPI(WithSettingEngine(settingEngine)).newPair(Configuration{})
+	assert.NoError(t, err)
+
+	peerConnectionConnected := untilConnectionState(PeerConnectionStateConnected, offerPC, answerPC)
+	assert.NoError(t, signalPair(offerPC, answerPC))
+
+	peerConnectionConnected.Wait()
+
+	offererSelectedPair, err := offerPC.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
+	assert.NoError(t, err)
+	assert.NotNil(t, offererSelectedPair)
+
+	answererSelectedPair, err := answerPC.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
+	assert.NoError(t, err)
+	assert.NotNil(t, answererSelectedPair)
+
+	for _, c := range []*ICECandidate{
+		answererSelectedPair.Local,
+		answererSelectedPair.Remote,
+		offererSelectedPair.Local,
+		offererSelectedPair.Remote,
+	} {
+		iceCandidate, err := c.ToICE()
+		assert.NoError(t, err)
+		assert.Equal(t, iceCandidate.NetworkType(), ice.NetworkTypeUDP6)
+	}
+
+	closePairNow(t, offerPC, answerPC)
+}
+
+type testICELogger struct {
+	lastErrorMessage string
+}
+
+func (t *testICELogger) Trace(string)                  {}
+func (t *testICELogger) Tracef(string, ...interface{}) {}
+func (t *testICELogger) Debug(string)                  {}
+func (t *testICELogger) Debugf(string, ...interface{}) {}
+func (t *testICELogger) Info(string)                   {}
+func (t *testICELogger) Infof(string, ...interface{})  {}
+func (t *testICELogger) Warn(string)                   {}
+func (t *testICELogger) Warnf(string, ...interface{})  {}
+func (t *testICELogger) Error(msg string)              { t.lastErrorMessage = msg }
+func (t *testICELogger) Errorf(format string, args ...interface{}) {
+	t.lastErrorMessage = fmt.Sprintf(format, args...)
+}
+
+type testICELoggerFactory struct {
+	logger *testICELogger
+}
+
+func (t *testICELoggerFactory) NewLogger(string) logging.LeveledLogger {
+	return t.logger
+}
+
+func TestAddICECandidate__DroppingOldGenerationCandidates(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	testLogger := &testICELogger{}
+	loggerFactory := &testICELoggerFactory{logger: testLogger}
+
+	// Create a new API with the custom logger
+	api := NewAPI(WithSettingEngine(SettingEngine{
+		LoggerFactory: loggerFactory,
+	}))
+
+	pc, err := api.NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	_, err = pc.CreateDataChannel("test", nil)
+	assert.NoError(t, err)
+
+	offer, err := pc.CreateOffer(nil)
+	assert.NoError(t, err)
+
+	offerGatheringComplete := GatheringCompletePromise(pc)
+	assert.NoError(t, pc.SetLocalDescription(offer))
+	<-offerGatheringComplete
+
+	remotePC, err := api.NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	assert.NoError(t, remotePC.SetRemoteDescription(offer))
+
+	remoteDesc := remotePC.RemoteDescription()
+	assert.NotNil(t, remoteDesc)
+
+	ufrag, hasUfrag := remoteDesc.parsed.MediaDescriptions[0].Attribute("ice-ufrag")
+	assert.True(t, hasUfrag)
+
+	emptyUfragCandidate := ICECandidateInit{
+		Candidate: "candidate:1 1 UDP 2122252543 192.168.1.1 12345 typ host",
+	}
+	err = remotePC.AddICECandidate(emptyUfragCandidate)
+	assert.NoError(t, err)
+	assert.Empty(t, testLogger.lastErrorMessage)
+
+	validCandidate := ICECandidateInit{
+		Candidate: fmt.Sprintf("candidate:1 1 UDP 2122252543 192.168.1.1 12345 typ host ufrag %s", ufrag),
+	}
+	err = remotePC.AddICECandidate(validCandidate)
+	assert.NoError(t, err)
+	assert.Empty(t, testLogger.lastErrorMessage)
+
+	invalidCandidate := ICECandidateInit{
+		Candidate: "candidate:1 1 UDP 2122252543 192.168.1.1 12345 typ host ufrag invalid",
+	}
+	err = remotePC.AddICECandidate(invalidCandidate)
+	assert.NoError(t, err)
+	assert.Contains(t, testLogger.lastErrorMessage, "dropping candidate with ufrag")
+
+	closePairNow(t, pc, remotePC)
 }

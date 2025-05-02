@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
 package ivfwriter
 
 import (
@@ -187,7 +190,7 @@ func TestIVFWriter_VP8(t *testing.T) {
 	}
 
 	// first test tries to write a valid VP8 packet
-	writer, err := NewWith(addPacketTestCase[0].buffer)
+	writer, err := NewWith(addPacketTestCase[0].buffer, WithCodec(mimeTypeVP8))
 	assert.Nil(err, "IVFWriter should be created")
 	assert.NotNil(writer, "Writer shouldn't be nil")
 	assert.False(writer.seenKeyFrame, "Writer's seenKeyFrame should initialize false")
@@ -212,15 +215,18 @@ func TestIVFWriter_VP8(t *testing.T) {
 	// Third test tries to write a valid VP8 packet - No Keyframe
 	assert.False(addPacketTestCase[0].writer.seenKeyFrame, "Writer's seenKeyFrame should remain false")
 	assert.Equal(uint64(0), addPacketTestCase[0].writer.count, "Writer's packet count should remain 0")
-	assert.Equal(nil, addPacketTestCase[0].writer.WriteRTP(midPartPacket), "Write packet failed") // add a mid partition packet
+	// add a mid partition packet
+	assert.Equal(nil, addPacketTestCase[0].writer.WriteRTP(midPartPacket), "Write packet failed")
 	assert.Equal(uint64(0), addPacketTestCase[0].writer.count, "Writer's packet count should remain 0")
 
 	// Fifth test tries to write a keyframe packet
 	assert.True(addPacketTestCase[1].writer.seenKeyFrame, "Writer's seenKeyFrame should now be true")
 	assert.Equal(uint64(1), addPacketTestCase[1].writer.count, "Writer's packet count should now be 1")
-	assert.Equal(nil, addPacketTestCase[1].writer.WriteRTP(midPartPacket), "Write packet failed") // add a mid partition packet
+	// add a mid partition packet
+	assert.Equal(nil, addPacketTestCase[1].writer.WriteRTP(midPartPacket), "Write packet failed")
 	assert.Equal(uint64(1), addPacketTestCase[1].writer.count, "Writer's packet count should remain 1")
-	assert.Equal(nil, addPacketTestCase[1].writer.WriteRTP(validPacket), "Write packet failed") // add a valid packet
+	// add a valid packet
+	assert.Equal(nil, addPacketTestCase[1].writer.WriteRTP(validPacket), "Write packet failed")
 	assert.Equal(uint64(2), addPacketTestCase[1].writer.count, "Writer's packet count should now be 2")
 
 	for _, t := range addPacketTestCase {
@@ -229,4 +235,154 @@ func TestIVFWriter_VP8(t *testing.T) {
 			assert.Equal(res, t.closeErr, t.messageClose)
 		}
 	}
+}
+
+func TestIVFWriter_EmptyPayload(t *testing.T) {
+	buffer := &bytes.Buffer{}
+
+	writer, err := NewWith(buffer)
+	assert.NoError(t, err)
+
+	assert.NoError(t, writer.WriteRTP(&rtp.Packet{Payload: []byte{}}))
+}
+
+func TestIVFWriter_Errors(t *testing.T) {
+	// Creating a Writer with AV1 and VP8
+	_, err := NewWith(&bytes.Buffer{}, WithCodec(mimeTypeAV1), WithCodec(mimeTypeAV1))
+	assert.ErrorIs(t, err, errCodecAlreadySet)
+
+	// Creating a Writer with Invalid Codec
+	_, err = NewWith(&bytes.Buffer{}, WithCodec(""))
+	assert.ErrorIs(t, err, errNoSuchCodec)
+}
+
+func TestIVFWriter_AV1(t *testing.T) {
+	t.Run("Unfragmented", func(t *testing.T) {
+		buffer := &bytes.Buffer{}
+
+		writer, err := NewWith(buffer, WithCodec(mimeTypeAV1))
+		assert.NoError(t, err)
+
+		assert.NoError(
+			t,
+			writer.WriteRTP(
+				&rtp.Packet{
+					Header: rtp.Header{Marker: true},
+					// N = 1, Length = 1, OBU_TYPE = 4
+					Payload: []byte{0x08, 0x01, 0x20},
+				}),
+		)
+
+		assert.NoError(t, writer.Close())
+		assert.Equal(t, buffer.Bytes(), []byte{
+			0x44, 0x4b, 0x49, 0x46, 0x0, 0x0, 0x20, 0x0, 0x41, 0x56, 0x30, 0x31,
+			0x80, 0x2, 0xe0, 0x1, 0x1e, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x84,
+			0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+			0x0, 0x0, 0x0, 0x0, 0x0, 0x12, 0x0, 0x22, 0x0,
+		})
+	})
+
+	t.Run("Fragmented", func(t *testing.T) {
+		buffer := &bytes.Buffer{}
+
+		writer, err := NewWith(buffer, WithCodec(mimeTypeAV1))
+		assert.NoError(t, err)
+
+		for _, p := range [][]byte{
+			{0x48, 0x02, 0x00, 0x01}, // Y=true
+			{0xc0, 0x02, 0x02, 0x03}, // Z=true, Y=true
+			{0xc0, 0x02, 0x04, 0x04}, // Z=true, Y=true
+			{0x80, 0x01, 0x05},       // Z=true, Y=false (But we still don't set Marker to true)
+		} {
+			assert.NoError(t, writer.WriteRTP(&rtp.Packet{Payload: p, Header: rtp.Header{Marker: false}}))
+			assert.Equal(t, buffer.Bytes(), []byte{
+				0x44, 0x4b, 0x49, 0x46, 0x0,
+				0x0, 0x20, 0x0, 0x41, 0x56, 0x30,
+				0x31, 0x80, 0x2, 0xe0, 0x1, 0x1e,
+				0x0, 0x0, 0x0, 0x1, 0x0, 0x0,
+				0x0, 0x84, 0x3, 0x0, 0x0, 0x0, 0x0,
+				0x0, 0x0,
+			})
+		}
+		assert.NoError(t, writer.WriteRTP(&rtp.Packet{Payload: []byte{0x08, 0x01, 0x20}, Header: rtp.Header{Marker: true}}))
+		assert.Equal(t, buffer.Bytes(), []byte{
+			0x44, 0x4b, 0x49, 0x46, 0x0, 0x0, 0x20, 0x0, 0x41, 0x56, 0x30, 0x31, 0x80, 0x2, 0xe0, 0x1, 0x1e,
+			0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x84, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x0, 0x0, 0x0,
+			0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x12, 0x0, 0x2, 0x6, 0x1, 0x2, 0x3, 0x4, 0x4, 0x5, 0x22, 0x0,
+		})
+		assert.NoError(t, writer.Close())
+	})
+
+	t.Run("Invalid OBU", func(t *testing.T) {
+		buffer := &bytes.Buffer{}
+
+		writer, err := NewWith(buffer, WithCodec(mimeTypeAV1))
+		assert.NoError(t, err)
+
+		assert.Error(t, writer.WriteRTP(&rtp.Packet{Payload: []byte{0x08, 0x02, 0xff}}))
+		assert.Error(t, writer.WriteRTP(&rtp.Packet{Payload: []byte{0x08, 0x01, 0xff}}))
+	})
+
+	t.Run("Skips middle sequence start", func(t *testing.T) {
+		buffer := &bytes.Buffer{}
+
+		writer, err := NewWith(buffer, WithCodec(mimeTypeAV1))
+		assert.NoError(t, err)
+
+		assert.NoError(t, writer.WriteRTP(&rtp.Packet{Header: rtp.Header{Marker: true}, Payload: []byte{0x00, 0x01, 0x20}}))
+
+		assert.NoError(
+			t,
+			writer.WriteRTP(
+				&rtp.Packet{
+					Header: rtp.Header{Marker: true},
+					// N = 1, Length = 1, OBU_TYPE = 4
+					Payload: []byte{0x08, 0x01, 0x20},
+				},
+			),
+		)
+
+		assert.NoError(t, writer.Close())
+		assert.Equal(t, buffer.Bytes(), []byte{
+			0x44, 0x4b, 0x49, 0x46, 0x0, 0x0, 0x20, 0x0, 0x41, 0x56, 0x30, 0x31,
+			0x80, 0x2, 0xe0, 0x1, 0x1e, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x84,
+			0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+			0x0, 0x0, 0x0, 0x0, 0x0, 0x12, 0x0, 0x22, 0x0,
+		})
+	})
+}
+
+func TestIVFWriter_VP9(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	writer, err := NewWith(buffer, WithCodec(mimeTypeVP9))
+	assert.NoError(t, err)
+
+	// No keyframe yet, ignore non-keyframe packets (P)
+	assert.NoError(t, writer.WriteRTP(&rtp.Packet{Payload: []byte{0xD0, 0x02, 0xAA}}))
+	assert.Equal(t, buffer.Bytes(), []byte{
+		0x44, 0x4b, 0x49, 0x46, 0x00, 0x00, 0x20, 0x00, 0x56, 0x50, 0x39, 0x30, 0x80, 0x02, 0xe0, 0x01,
+		0x1e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x84, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	})
+
+	// No current frame, ignore packets that don't start a frame (B)
+	assert.NoError(t, writer.WriteRTP(&rtp.Packet{Payload: []byte{0x00, 0xAA}}))
+	assert.Equal(t, buffer.Bytes(), []byte{
+		0x44, 0x4b, 0x49, 0x46, 0x00, 0x00, 0x20, 0x00, 0x56, 0x50, 0x39, 0x30, 0x80, 0x02, 0xe0, 0x01,
+		0x1e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x84, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	})
+
+	// B packet, no marker bit
+	assert.NoError(t, writer.WriteRTP(&rtp.Packet{Payload: []byte{0x08, 0xAA}}))
+	assert.Equal(t, buffer.Bytes(), []byte{
+		0x44, 0x4b, 0x49, 0x46, 0x00, 0x00, 0x20, 0x00, 0x56, 0x50, 0x39, 0x30, 0x80, 0x02, 0xe0, 0x01,
+		0x1e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x84, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	})
+
+	// B packet, Marker Bit
+	assert.NoError(t, writer.WriteRTP(&rtp.Packet{Header: rtp.Header{Marker: true}, Payload: []byte{0x08, 0xAB}}))
+	assert.Equal(t, buffer.Bytes(), []byte{
+		0x44, 0x4b, 0x49, 0x46, 0x00, 0x00, 0x20, 0x00, 0x56, 0x50, 0x39, 0x30, 0x80, 0x02, 0xe0, 0x01,
+		0x1e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x84, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaa, 0xab,
+	})
 }

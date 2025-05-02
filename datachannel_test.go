@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
 package webrtc
 
 import (
@@ -7,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/transport/test"
+	"github.com/pion/transport/v3/test"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -16,50 +19,55 @@ import (
 // bindings this is a requirement).
 const expectedLabel = "data"
 
-func closePairNow(t testing.TB, pc1, pc2 io.Closer) {
+func closePairNow(tb testing.TB, pc1, pc2 io.Closer) {
+	tb.Helper()
+
 	var fail bool
 	if err := pc1.Close(); err != nil {
-		t.Errorf("Failed to close PeerConnection: %v", err)
+		tb.Errorf("Failed to close PeerConnection: %v", err)
 		fail = true
 	}
 	if err := pc2.Close(); err != nil {
-		t.Errorf("Failed to close PeerConnection: %v", err)
+		tb.Errorf("Failed to close PeerConnection: %v", err)
 		fail = true
 	}
 	if fail {
-		t.FailNow()
+		tb.FailNow()
 	}
 }
 
 func closePair(t *testing.T, pc1, pc2 io.Closer, done <-chan bool) {
+	t.Helper()
+
 	select {
 	case <-time.After(10 * time.Second):
-		t.Fatalf("closePair timed out waiting for done signal")
+		assert.Fail(t, "closePair timed out waiting for done signal")
 	case <-done:
 		closePairNow(t, pc1, pc2)
 	}
 }
 
-func setUpDataChannelParametersTest(t *testing.T, options *DataChannelInit) (*PeerConnection, *PeerConnection, *DataChannel, chan bool) {
+func setUpDataChannelParametersTest(
+	t *testing.T,
+	options *DataChannelInit,
+) (*PeerConnection, *PeerConnection, *DataChannel, chan bool) {
+	t.Helper()
+
 	offerPC, answerPC, err := newPair()
-	if err != nil {
-		t.Fatalf("Failed to create a PC pair for testing")
-	}
+	assert.NoError(t, err)
 	done := make(chan bool)
 
 	dc, err := offerPC.CreateDataChannel(expectedLabel, options)
-	if err != nil {
-		t.Fatalf("Failed to create a PC pair for testing")
-	}
+	assert.NoError(t, err)
 
 	return offerPC, answerPC, dc, done
 }
 
 func closeReliabilityParamTest(t *testing.T, pc1, pc2 *PeerConnection, done chan bool) {
+	t.Helper()
+
 	err := signalPair(pc1, pc2)
-	if err != nil {
-		t.Fatalf("Failed to signal our PC pair for testing")
-	}
+	assert.NoError(t, err)
 
 	closePair(t, pc1, pc2, done)
 }
@@ -72,6 +80,8 @@ func BenchmarkDataChannelSend32(b *testing.B) { benchmarkDataChannelSend(b, 32) 
 
 // See https://github.com/pion/webrtc/issues/1516
 func benchmarkDataChannelSend(b *testing.B, numChannels int) {
+	b.Helper()
+
 	offerPC, answerPC, err := newPair()
 	if err != nil {
 		b.Fatalf("Failed to create a PC pair for testing")
@@ -111,17 +121,17 @@ func benchmarkDataChannelSend(b *testing.B, numChannels int) {
 }
 
 func TestDataChannel_Open(t *testing.T) {
+	const openOnceChannelCapacity = 2
+
 	t.Run("handler should be called once", func(t *testing.T) {
 		report := test.CheckRoutines(t)
 		defer report()
 
 		offerPC, answerPC, err := newPair()
-		if err != nil {
-			t.Fatalf("Failed to create a PC pair for testing")
-		}
+		assert.NoError(t, err)
 
 		done := make(chan bool)
-		openCalls := make(chan bool, 2)
+		openCalls := make(chan bool, openOnceChannelCapacity)
 
 		answerPC.OnDataChannel(func(d *DataChannel) {
 			if d.Label() != expectedLabel {
@@ -130,7 +140,7 @@ func TestDataChannel_Open(t *testing.T) {
 			d.OnOpen(func() {
 				openCalls <- true
 			})
-			d.OnMessage(func(msg DataChannelMessage) {
+			d.OnMessage(func(DataChannelMessage) {
 				go func() {
 					// Wait a little bit to ensure all messages are processed.
 					time.Sleep(100 * time.Millisecond)
@@ -143,10 +153,7 @@ func TestDataChannel_Open(t *testing.T) {
 		assert.NoError(t, err)
 
 		dc.OnOpen(func() {
-			e := dc.SendText("Ping")
-			if e != nil {
-				t.Fatalf("Failed to send string on data channel")
-			}
+			assert.NoError(t, dc.SendText("Ping"), "Failed to send string on data channel")
 		})
 
 		assert.NoError(t, signalPair(offerPC, answerPC))
@@ -155,17 +162,67 @@ func TestDataChannel_Open(t *testing.T) {
 
 		assert.Len(t, openCalls, 1)
 	})
+
+	t.Run("handler should be called once when already negotiated", func(t *testing.T) {
+		report := test.CheckRoutines(t)
+		defer report()
+
+		offerPC, answerPC, err := newPair()
+		assert.NoError(t, err)
+
+		done := make(chan bool)
+		answerOpenCalls := make(chan bool, openOnceChannelCapacity)
+		offerOpenCalls := make(chan bool, openOnceChannelCapacity)
+
+		negotiated := true
+		ordered := true
+		dataChannelID := uint16(0)
+
+		answerDC, err := answerPC.CreateDataChannel(expectedLabel, &DataChannelInit{
+			ID:         &dataChannelID,
+			Negotiated: &negotiated,
+			Ordered:    &ordered,
+		})
+		assert.NoError(t, err)
+		offerDC, err := offerPC.CreateDataChannel(expectedLabel, &DataChannelInit{
+			ID:         &dataChannelID,
+			Negotiated: &negotiated,
+			Ordered:    &ordered,
+		})
+		assert.NoError(t, err)
+
+		answerDC.OnMessage(func(DataChannelMessage) {
+			go func() {
+				// Wait a little bit to ensure all messages are processed.
+				time.Sleep(100 * time.Millisecond)
+				done <- true
+			}()
+		})
+		answerDC.OnOpen(func() {
+			answerOpenCalls <- true
+		})
+
+		offerDC.OnOpen(func() {
+			offerOpenCalls <- true
+			assert.NoError(t, offerDC.SendText("Ping"), "Failed to send string on data channel")
+		})
+
+		assert.NoError(t, signalPair(offerPC, answerPC))
+
+		closePair(t, offerPC, answerPC, done)
+
+		assert.Len(t, answerOpenCalls, 1)
+		assert.Len(t, offerOpenCalls, 1)
+	})
 }
 
-func TestDataChannel_Send(t *testing.T) {
+func TestDataChannel_Send(t *testing.T) { //nolint:cyclop
 	t.Run("before signaling", func(t *testing.T) {
 		report := test.CheckRoutines(t)
 		defer report()
 
 		offerPC, answerPC, err := newPair()
-		if err != nil {
-			t.Fatalf("Failed to create a PC pair for testing")
-		}
+		assert.NoError(t, err)
 
 		done := make(chan bool)
 
@@ -175,36 +232,26 @@ func TestDataChannel_Send(t *testing.T) {
 			if d.Label() != expectedLabel {
 				return
 			}
-			d.OnMessage(func(msg DataChannelMessage) {
-				e := d.Send([]byte("Pong"))
-				if e != nil {
-					t.Fatalf("Failed to send string on data channel")
-				}
+			d.OnMessage(func(DataChannelMessage) {
+				assert.NoError(t, d.Send([]byte("Pong")), "Failed to send string on data channel")
 			})
 			assert.True(t, d.Ordered(), "Ordered should be set to true")
 		})
 
 		dc, err := offerPC.CreateDataChannel(expectedLabel, nil)
-		if err != nil {
-			t.Fatalf("Failed to create a PC pair for testing")
-		}
+		assert.NoError(t, err)
 
 		assert.True(t, dc.Ordered(), "Ordered should be set to true")
 
 		dc.OnOpen(func() {
-			e := dc.SendText("Ping")
-			if e != nil {
-				t.Fatalf("Failed to send string on data channel")
-			}
+			assert.NoError(t, dc.SendText("Ping"), "Failed to send string on data channel")
 		})
-		dc.OnMessage(func(msg DataChannelMessage) {
+		dc.OnMessage(func(DataChannelMessage) {
 			done <- true
 		})
 
 		err = signalPair(offerPC, answerPC)
-		if err != nil {
-			t.Fatalf("Failed to signal our PC pair for testing: %+v", err)
-		}
+		assert.NoError(t, err)
 
 		closePair(t, offerPC, answerPC, done)
 	})
@@ -214,9 +261,7 @@ func TestDataChannel_Send(t *testing.T) {
 		defer report()
 
 		offerPC, answerPC, err := newPair()
-		if err != nil {
-			t.Fatalf("Failed to create a PC pair for testing")
-		}
+		assert.NoError(t, err)
 
 		done := make(chan bool)
 
@@ -226,11 +271,8 @@ func TestDataChannel_Send(t *testing.T) {
 			if d.Label() != expectedLabel {
 				return
 			}
-			d.OnMessage(func(msg DataChannelMessage) {
-				e := d.Send([]byte("Pong"))
-				if e != nil {
-					t.Fatalf("Failed to send string on data channel")
-				}
+			d.OnMessage(func(DataChannelMessage) {
+				assert.NoError(t, d.Send([]byte("Pong")), "Failed to send string on data channel")
 			})
 			assert.True(t, d.Ordered(), "Ordered should be set to true")
 		})
@@ -241,23 +283,18 @@ func TestDataChannel_Send(t *testing.T) {
 				// wasm fires completed state multiple times
 				once.Do(func() {
 					dc, createErr := offerPC.CreateDataChannel(expectedLabel, nil)
-					if createErr != nil {
-						t.Fatalf("Failed to create a PC pair for testing")
-					}
+					assert.NoError(t, createErr)
 
 					assert.True(t, dc.Ordered(), "Ordered should be set to true")
 
-					dc.OnMessage(func(msg DataChannelMessage) {
+					dc.OnMessage(func(DataChannelMessage) {
 						done <- true
 					})
 
 					if e := dc.SendText("Ping"); e != nil {
 						// wasm binding doesn't fire OnOpen (we probably already missed it)
 						dc.OnOpen(func() {
-							e = dc.SendText("Ping")
-							if e != nil {
-								t.Fatalf("Failed to send string on data channel")
-							}
+							assert.NoError(t, dc.SendText("Ping"), "Failed to send string on data channel")
 						})
 					}
 				})
@@ -265,9 +302,7 @@ func TestDataChannel_Send(t *testing.T) {
 		})
 
 		err = signalPair(offerPC, answerPC)
-		if err != nil {
-			t.Fatalf("Failed to signal our PC pair for testing")
-		}
+		assert.NoError(t, err)
 
 		closePair(t, offerPC, answerPC, done)
 	})
@@ -300,7 +335,7 @@ func TestDataChannel_Close(t *testing.T) {
 	})
 }
 
-func TestDataChannelParameters(t *testing.T) {
+func TestDataChannelParameters(t *testing.T) { //nolint:cyclop
 	report := test.CheckRoutines(t)
 	defer report()
 
@@ -409,14 +444,10 @@ func TestDataChannelParameters(t *testing.T) {
 
 		answerPC.OnDataChannel(func(d *DataChannel) {
 			// Ignore our default channel, exists to force ICE candidates. See signalPair for more info
-			if d.Label() == "initial_data_channel" {
-				return
-			}
-
-			t.Fatal("OnDataChannel must not be fired when negotiated == true")
+			assert.Equal(t, "initial_data_channel", d.Label(), "OnDataChannel must not be fired when negotiated == true")
 		})
-		offerPC.OnDataChannel(func(d *DataChannel) {
-			t.Fatal("OnDataChannel must not be fired when negotiated == true")
+		offerPC.OnDataChannel(func(*DataChannel) {
+			assert.Fail(t, "OnDataChannel must not be fired when negotiated == true")
 		})
 
 		seenAnswerMessage := &atomicBool{}
@@ -435,11 +466,7 @@ func TestDataChannelParameters(t *testing.T) {
 		})
 
 		go func() {
-			for {
-				if seenAnswerMessage.get() && seenOfferMessage.get() {
-					break
-				}
-
+			for seenAnswerMessage.get() && seenOfferMessage.get() {
 				if offerDatachannel.ReadyState() == DataChannelStateOpen {
 					assert.NoError(t, offerDatachannel.SendText(expectedMessage))
 				}

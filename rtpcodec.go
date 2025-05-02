@@ -1,27 +1,33 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
 package webrtc
 
 import (
+	"fmt"
 	"strings"
 
-	"github.com/pion/webrtc/v3/internal/fmtp"
+	"github.com/pion/webrtc/v4/internal/fmtp"
 )
 
-// RTPCodecType determines the type of a codec
+// RTPCodecType determines the type of a codec.
 type RTPCodecType int
 
 const (
+	// RTPCodecTypeUnknown is the enum's zero-value.
+	RTPCodecTypeUnknown RTPCodecType = iota
 
-	// RTPCodecTypeAudio indicates this is an audio codec
-	RTPCodecTypeAudio RTPCodecType = iota + 1
+	// RTPCodecTypeAudio indicates this is an audio codec.
+	RTPCodecTypeAudio
 
-	// RTPCodecTypeVideo indicates this is a video codec
+	// RTPCodecTypeVideo indicates this is a video codec.
 	RTPCodecTypeVideo
 )
 
 func (t RTPCodecType) String() string {
 	switch t {
 	case RTPCodecTypeAudio:
-		return "audio"
+		return "audio" //nolint: goconst
 	case RTPCodecTypeVideo:
 		return "video" //nolint: goconst
 	default:
@@ -29,7 +35,7 @@ func (t RTPCodecType) String() string {
 	}
 }
 
-// NewRTPCodecType creates a RTPCodecType from a string
+// NewRTPCodecType creates a RTPCodecType from a string.
 func NewRTPCodecType(r string) RTPCodecType {
 	switch {
 	case strings.EqualFold(r, RTPCodecTypeAudio.String()):
@@ -97,24 +103,79 @@ const (
 
 // Do a fuzzy find for a codec in the list of codecs
 // Used for lookup up a codec in an existing list to find a match
-// Returns codecMatchExact, codecMatchPartial, or codecMatchNone
-func codecParametersFuzzySearch(needle RTPCodecParameters, haystack []RTPCodecParameters) (RTPCodecParameters, codecMatchType) {
-	needleFmtp := fmtp.Parse(needle.RTPCodecCapability.MimeType, needle.RTPCodecCapability.SDPFmtpLine)
+// Returns codecMatchExact, codecMatchPartial, or codecMatchNone.
+func codecParametersFuzzySearch(
+	needle RTPCodecParameters,
+	haystack []RTPCodecParameters,
+) (RTPCodecParameters, codecMatchType) {
+	needleFmtp := fmtp.Parse(
+		needle.RTPCodecCapability.MimeType,
+		needle.RTPCodecCapability.ClockRate,
+		needle.RTPCodecCapability.Channels,
+		needle.RTPCodecCapability.SDPFmtpLine)
 
-	// First attempt to match on MimeType + SDPFmtpLine
+	// First attempt to match on MimeType + ClockRate + Channels + SDPFmtpLine
 	for _, c := range haystack {
-		cfmtp := fmtp.Parse(c.RTPCodecCapability.MimeType, c.RTPCodecCapability.SDPFmtpLine)
+		cfmtp := fmtp.Parse(
+			c.RTPCodecCapability.MimeType,
+			c.RTPCodecCapability.ClockRate,
+			c.RTPCodecCapability.Channels,
+			c.RTPCodecCapability.SDPFmtpLine)
+
 		if needleFmtp.Match(cfmtp) {
 			return c, codecMatchExact
 		}
 	}
 
-	// Fallback to just MimeType
+	// Fallback to just MimeType + ClockRate + Channels
 	for _, c := range haystack {
-		if strings.EqualFold(c.RTPCodecCapability.MimeType, needle.RTPCodecCapability.MimeType) {
+		if strings.EqualFold(c.RTPCodecCapability.MimeType, needle.RTPCodecCapability.MimeType) &&
+			fmtp.ClockRateEqual(c.RTPCodecCapability.MimeType,
+				c.RTPCodecCapability.ClockRate,
+				needle.RTPCodecCapability.ClockRate) &&
+			fmtp.ChannelsEqual(c.RTPCodecCapability.MimeType,
+				c.RTPCodecCapability.Channels,
+				needle.RTPCodecCapability.Channels) {
 			return c, codecMatchPartial
 		}
 	}
 
 	return RTPCodecParameters{}, codecMatchNone
+}
+
+// Given a CodecParameters find the RTX CodecParameters if one exists.
+func findRTXPayloadType(needle PayloadType, haystack []RTPCodecParameters) PayloadType {
+	aptStr := fmt.Sprintf("apt=%d", needle)
+	for _, c := range haystack {
+		if aptStr == c.SDPFmtpLine {
+			return c.PayloadType
+		}
+	}
+
+	return PayloadType(0)
+}
+
+// For now, only FlexFEC is supported.
+func findFECPayloadType(haystack []RTPCodecParameters) PayloadType {
+	for _, c := range haystack {
+		if strings.Contains(c.RTPCodecCapability.MimeType, MimeTypeFlexFEC) {
+			return c.PayloadType
+		}
+	}
+
+	return PayloadType(0)
+}
+
+func rtcpFeedbackIntersection(a, b []RTCPFeedback) (out []RTCPFeedback) {
+	for _, aFeedback := range a {
+		for _, bFeeback := range b {
+			if aFeedback.Type == bFeeback.Type && aFeedback.Parameter == bFeeback.Parameter {
+				out = append(out, aFeedback)
+
+				break
+			}
+		}
+	}
+
+	return
 }

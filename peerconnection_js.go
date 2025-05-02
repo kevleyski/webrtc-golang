@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
+//go:build js && wasm
 // +build js,wasm
 
 // Package webrtc implements the WebRTC 1.0 as defined in W3C WebRTC specification document.
@@ -6,8 +10,8 @@ package webrtc
 import (
 	"syscall/js"
 
-	"github.com/pion/ice/v2"
-	"github.com/pion/webrtc/v3/pkg/rtcerr"
+	"github.com/pion/ice/v4"
+	"github.com/pion/webrtc/v4/pkg/rtcerr"
 )
 
 // PeerConnection represents a WebRTC connection that establishes a
@@ -55,6 +59,7 @@ func (api *API) NewPeerConnection(configuration Configuration) (_ *PeerConnectio
 	}, nil
 }
 
+// JSValue returns the underlying PeerConnection
 func (pc *PeerConnection) JSValue() js.Value {
 	return pc.underlying
 }
@@ -177,14 +182,14 @@ func (pc *PeerConnection) checkConfiguration(configuration Configuration) error 
 	// }
 
 	// https://www.w3.org/TR/webrtc/#set-the-configuration (step #5)
-	if configuration.BundlePolicy != BundlePolicy(Unknown) {
+	if configuration.BundlePolicy != BundlePolicyUnknown {
 		if configuration.BundlePolicy != existingConfig.BundlePolicy {
 			return &rtcerr.InvalidModificationError{Err: ErrModifyingBundlePolicy}
 		}
 	}
 
 	// https://www.w3.org/TR/webrtc/#set-the-configuration (step #6)
-	if configuration.RTCPMuxPolicy != RTCPMuxPolicy(Unknown) {
+	if configuration.RTCPMuxPolicy != RTCPMuxPolicyUnknown {
 		if configuration.RTCPMuxPolicy != existingConfig.RTCPMuxPolicy {
 			return &rtcerr.InvalidModificationError{Err: ErrModifyingRTCPMuxPolicy}
 		}
@@ -500,7 +505,6 @@ func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RTPT
 		return &RTPTransceiver{
 			underlying: pc.underlying.Call("addTransceiver", kind.String(), rtpTransceiverInitInitToValue(init[0])),
 		}, err
-
 	}
 
 	return &RTPTransceiver{
@@ -520,6 +524,21 @@ func (pc *PeerConnection) GetTransceivers() (transceivers []*RTPTransceiver) {
 	}
 
 	return
+}
+
+// SCTP returns the SCTPTransport for this PeerConnection
+//
+// The SCTP transport over which SCTP data is sent and received. If SCTP has not been negotiated, the value is nil.
+// https://www.w3.org/TR/webrtc/#attributes-15
+func (pc *PeerConnection) SCTP() *SCTPTransport {
+	underlying := pc.underlying.Get("sctp")
+	if underlying.IsNull() || underlying.IsUndefined() {
+		return nil
+	}
+
+	return &SCTPTransport{
+		underlying: underlying,
+	}
 }
 
 // Converts a Configuration to js.Value so it can be passed
@@ -550,18 +569,35 @@ func iceServersToValue(iceServers []ICEServer) js.Value {
 	return js.ValueOf(maps)
 }
 
+func oauthCredentialToValue(o OAuthCredential) js.Value {
+	out := map[string]interface{}{
+		"MACKey":      o.MACKey,
+		"AccessToken": o.AccessToken,
+	}
+	return js.ValueOf(out)
+}
+
 func iceServerToValue(server ICEServer) js.Value {
-	return js.ValueOf(map[string]interface{}{
-		"urls":     stringsToValue(server.URLs), // required
-		"username": stringToValueOrUndefined(server.Username),
-		// Note: credential and credentialType are not currently supported.
-		// "credential":     interfaceToValueOrUndefined(server.Credential),
-		// "credentialType": stringEnumToValueOrUndefined(server.CredentialType.String()),
-	})
+	out := map[string]interface{}{
+		"urls": stringsToValue(server.URLs), // required
+	}
+	if server.Username != "" {
+		out["username"] = stringToValueOrUndefined(server.Username)
+	}
+	if server.Credential != nil {
+		switch t := server.Credential.(type) {
+		case string:
+			out["credential"] = stringToValueOrUndefined(t)
+		case OAuthCredential:
+			out["credential"] = oauthCredentialToValue(t)
+		}
+	}
+	out["credentialType"] = stringEnumToValueOrUndefined(server.CredentialType.String())
+	return js.ValueOf(out)
 }
 
 func valueToConfiguration(configValue js.Value) Configuration {
-	if jsValueIsNull(configValue) || jsValueIsUndefined(configValue) {
+	if configValue.IsNull() || configValue.IsUndefined() {
 		return Configuration{}
 	}
 	return Configuration{
@@ -578,7 +614,7 @@ func valueToConfiguration(configValue js.Value) Configuration {
 }
 
 func valueToICEServers(iceServersValue js.Value) []ICEServer {
-	if jsValueIsNull(iceServersValue) || jsValueIsUndefined(iceServersValue) {
+	if iceServersValue.IsNull() || iceServersValue.IsUndefined() {
 		return nil
 	}
 	iceServers := make([]ICEServer, iceServersValue.Length())
@@ -588,28 +624,50 @@ func valueToICEServers(iceServersValue js.Value) []ICEServer {
 	return iceServers
 }
 
+func valueToICECredential(iceCredentialValue js.Value) interface{} {
+	if iceCredentialValue.IsNull() || iceCredentialValue.IsUndefined() {
+		return nil
+	}
+	if iceCredentialValue.Type() == js.TypeString {
+		return iceCredentialValue.String()
+	}
+	if iceCredentialValue.Type() == js.TypeObject {
+		return OAuthCredential{
+			MACKey:      iceCredentialValue.Get("MACKey").String(),
+			AccessToken: iceCredentialValue.Get("AccessToken").String(),
+		}
+	}
+	return nil
+}
+
 func valueToICEServer(iceServerValue js.Value) ICEServer {
-	return ICEServer{
+	tpe, err := newICECredentialType(valueToStringOrZero(iceServerValue.Get("credentialType")))
+	if err != nil {
+		tpe = ICECredentialTypePassword
+	}
+	s := ICEServer{
 		URLs:     valueToStrings(iceServerValue.Get("urls")), // required
 		Username: valueToStringOrZero(iceServerValue.Get("username")),
 		// Note: Credential and CredentialType are not currently supported.
-		// Credential: iceServerValue.Get("credential"),
-		// CredentialType: newICECredentialType(valueToStringOrZero(iceServerValue.Get("credentialType"))),
+		Credential:     valueToICECredential(iceServerValue.Get("credential")),
+		CredentialType: tpe,
 	}
+
+	return s
 }
 
 func valueToICECandidate(val js.Value) *ICECandidate {
-	if jsValueIsNull(val) || jsValueIsUndefined(val) {
+	if val.IsNull() || val.IsUndefined() {
 		return nil
 	}
-	if jsValueIsUndefined(val.Get("protocol")) && !jsValueIsUndefined(val.Get("candidate")) {
+	if val.Get("protocol").IsUndefined() && !val.Get("candidate").IsUndefined() {
 		// Missing some fields, assume it's Firefox and parse SDP candidate.
 		c, err := ice.UnmarshalCandidate(val.Get("candidate").String())
 		if err != nil {
 			return nil
 		}
 
-		iceCandidate, err := newICECandidateFromICE(c)
+		iceCandidate, err := newICECandidateFromICE(c, "", 0)
 		if err != nil {
 			return nil
 		}
@@ -653,7 +711,7 @@ func sessionDescriptionToValue(desc *SessionDescription) js.Value {
 }
 
 func valueToSessionDescription(descValue js.Value) *SessionDescription {
-	if jsValueIsNull(descValue) || jsValueIsUndefined(descValue) {
+	if descValue.IsNull() || descValue.IsUndefined() {
 		return nil
 	}
 	return &SessionDescription{

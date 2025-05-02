@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
 package webrtc
 
 import (
@@ -13,7 +16,7 @@ func TestDTLSRole_String(t *testing.T) {
 		role           DTLSRole
 		expectedString string
 	}{
-		{DTLSRole(Unknown), unknownStr},
+		{DTLSRoleUnknown, ErrUnknownType.Error()},
 		{DTLSRoleAuto, "auto"},
 		{DTLSRoleClient, "client"},
 		{DTLSRoleServer, "server"},
@@ -31,9 +34,8 @@ func TestDTLSRole_String(t *testing.T) {
 func TestDTLSRoleFromRemoteSDP(t *testing.T) {
 	parseSDP := func(raw string) *sdp.SessionDescription {
 		parsed := &sdp.SessionDescription{}
-		if err := parsed.Unmarshal([]byte(raw)); err != nil {
-			panic(err)
-		}
+		assert.NoError(t, parsed.Unmarshal([]byte(raw)))
+
 		return parsed
 	}
 
